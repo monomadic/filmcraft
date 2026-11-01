@@ -84,6 +84,11 @@ pub struct MkvSource {
 /// spans whose samples are numbered from the window's start: playing on extends it at the end,
 /// which keeps every index the frame cache knows; asking for a frame outside it and the next span
 /// replaces it, and the cache is told its indices are void ([`GopCache::forget_position`]).
+///
+/// A frame presented in span `k` may be STORED in span `k + 1`: an open GOP's leading pictures
+/// (HEVC RASL, MPEG-2 B-frames before an open-GOP I) follow the random-access picture of cue
+/// `k + 1` in the file but show before it, and decode from span `k`'s keyframe. So a request in
+/// span `k` holds spans `k` and `k + 1` both.
 struct LazyState {
     demux: Demuxer<crate::Src>,
     /// Index of the video track in `MkvFile::tracks`.
@@ -194,25 +199,35 @@ impl LazyState {
         Ok(out)
     }
 
-    /// Make the window hold the span that presents `target` (track ticks, origin taken off).
+    /// Make the window hold the spans that present `target` (track ticks, origin taken off): its
+    /// own span `k` and `k + 1`, which holds `k`'s last frames when the GOP at cue `k + 1` is open.
     fn ensure(&mut self, target: i64, cache: &GopCache) -> crate::Result<()> {
         let raw = target.saturating_add(self.origin);
         let k = self.spans.partition_point(|&s| s <= raw).saturating_sub(1);
+        let end = (k + 1).min(self.spans.len() - 1);
         let (first, last) = self.window;
-        if (first..=last).contains(&k) {
+        if first <= k && end <= last {
             return Ok(());
         }
-        let samples = self.scan(k).map_err(|e| CodecError::Container(e.to_string()))?;
-        if k == last + 1 {
-            self.extend(samples);
-            self.window.1 = k;
-        } else {
-            self.samples.clear();
-            self.sync.clear();
-            self.extend(samples);
-            self.window = (k, k);
-            cache.forget_position();
+        if first <= k && k <= last + 1 {
+            // playing on: append the missing spans, every index the cache knows stays valid
+            for span in last + 1..=end {
+                let samples = self.scan(span).map_err(|e| CodecError::Container(e.to_string()))?;
+                self.extend(samples);
+                self.window.1 = span;
+            }
+            return Ok(());
         }
+        // scanned before anything is replaced: a failed scan leaves the window as it was
+        let mut samples = Vec::new();
+        for span in k..=end {
+            samples.extend(self.scan(span).map_err(|e| CodecError::Container(e.to_string()))?);
+        }
+        self.samples.clear();
+        self.sync.clear();
+        self.extend(samples);
+        self.window = (k, end);
+        cache.forget_position();
         Ok(())
     }
 }
