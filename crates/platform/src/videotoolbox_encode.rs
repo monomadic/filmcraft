@@ -11,7 +11,9 @@
 //!
 //! Pictures go in as 8-bit 4:2:0 (NV12) pixel buffers filled from planar BT.709 limited-range
 //! Y'CbCr, the layout of `filmcraft_export::rgba_to_yuv420_8`, so the colours match the built-in
-//! encoder's. VideoToolbox encodes asynchronously; its output callback (on a VideoToolbox thread)
+//! encoder's. An HEVC Main 10 session ([`VtProfile::HevcMain10`]) takes 10-bit 4:2:0 instead
+//! ([`VtEncoder::encode_10`], P010-style buffers with each code in the high bits of a 16-bit word),
+//! for sources and pictures that have more than 8 bits to keep; it is still BT.709 SDR. VideoToolbox encodes asynchronously; its output callback (on a VideoToolbox thread)
 //! copies each compressed frame (length-prefixed NAL units) into a queue that [`VtEncoder::encode`]
 //! and [`VtEncoder::flush`] drain.
 //!
@@ -42,12 +44,14 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
     kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kVTCompressionPropertyKey_YCbCrMatrix, kVTProfileLevel_H264_Baseline_AutoLevel,
-    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
+    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main10_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
 /// The pixel format of the buffers we hand over: biplanar Y + interleaved CbCr, video range.
 const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+/// The same for Main 10: 16-bit words, each 10-bit code in the high bits, video range.
+const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");
 /// Largest compressed frame accepted from the callback (a sanity cap on a size we do not control).
 const MAX_FRAME_BYTES: usize = 256 << 20;
 /// Largest picture the hardware encoder is asked for.
@@ -68,14 +72,25 @@ pub enum VtProfile {
     High,
     /// HEVC Main: 8-bit 4:2:0.
     HevcMain,
+    /// HEVC Main 10: 10-bit 4:2:0, pictures through [`VtEncoder::encode_10`].
+    HevcMain10,
 }
 
 impl VtProfile {
     pub fn codec(self) -> VtCodec {
         match self {
             VtProfile::Baseline | VtProfile::Main | VtProfile::High => VtCodec::H264,
-            VtProfile::HevcMain => VtCodec::Hevc,
+            VtProfile::HevcMain | VtProfile::HevcMain10 => VtCodec::Hevc,
         }
+    }
+
+    /// Whether the session takes 10-bit pictures ([`VtEncoder::encode_10`]).
+    pub fn ten_bit(self) -> bool {
+        self == VtProfile::HevcMain10
+    }
+
+    fn pixel_format(self) -> u32 {
+        if self.ten_bit() { P010_VIDEO } else { NV12_VIDEO }
     }
 }
 
@@ -368,32 +383,55 @@ fn plane_mut<'l>(pb: &CVImageBuffer, _lock: &'l mut Locked<'_>, i: usize) -> Res
     Ok((data, stride, width, height))
 }
 
-/// Copy planar Y / U / V (`w`×`h` luma, `⌈w/2⌉`×`⌈h/2⌉` chroma, tightly packed) into an NV12 buffer.
-fn fill(pb: &CVImageBuffer, w: usize, h: usize, y: &[u8], u: &[u8], v: &[u8]) -> Result<(), String> {
+/// One sample as the buffer stores it: a byte (NV12), or a 10-bit code in the high bits of a
+/// little-endian 16-bit word (P010).
+trait Sample: Copy {
+    const BYTES: usize;
+    fn put(self, out: &mut [u8]);
+}
+impl Sample for u8 {
+    const BYTES: usize = 1;
+    fn put(self, out: &mut [u8]) {
+        out[0] = self;
+    }
+}
+impl Sample for u16 {
+    const BYTES: usize = 2;
+    fn put(self, out: &mut [u8]) {
+        out[..2].copy_from_slice(&(self.min(1023) << 6).to_le_bytes());
+    }
+}
+
+/// Copy planar Y / U / V (`w`×`h` luma, `⌈w/2⌉`×`⌈h/2⌉` chroma, tightly packed) into a biplanar
+/// buffer: NV12 for bytes, P010 for 10-bit codes (a code above 1023 is clamped).
+fn fill<T: Sample>(pb: &CVImageBuffer, w: usize, h: usize, y: &[T], u: &[T], v: &[T]) -> Result<(), String> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
         return Err("the Y'CbCr planes are smaller than the picture".into());
     }
+    let n = T::BYTES;
     // SAFETY: `pb` is a valid pixel buffer (the caller holds it retained).
     if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags(0)) } != 0 {
         return Err("cannot lock the input buffer".into());
     }
     let mut lock = Locked(pb);
     let (luma, ls, lw, lh) = plane_mut(pb, &mut lock, 0)?;
-    if lw < w || lh < h || ls < w {
+    if lw < w || lh < h || ls < w * n {
         return Err("the input buffer's luma plane is smaller than the picture".into());
     }
     for (row, src) in luma.chunks_mut(ls).zip(y.chunks_exact(w)).take(h) {
-        row[..w].copy_from_slice(src);
+        for (out, &s) in row.chunks_exact_mut(n).zip(src) {
+            s.put(out);
+        }
     }
     let (chroma, cs, cpw, cph) = plane_mut(pb, &mut lock, 1)?;
-    if cpw < cw || cph < ch || cs < cw * 2 {
+    if cpw < cw || cph < ch || cs < cw * 2 * n {
         return Err("the input buffer's chroma plane is smaller than the picture".into());
     }
     for ((row, us), vs) in chroma.chunks_mut(cs).zip(u.chunks_exact(cw)).zip(v.chunks_exact(cw)).take(ch) {
-        for ((pair, &cb), &cr) in row.as_chunks_mut::<2>().0.iter_mut().zip(us).zip(vs) {
-            pair[0] = cb;
-            pair[1] = cr;
+        for ((pair, &cb), &cr) in row.chunks_exact_mut(2 * n).zip(us).zip(vs) {
+            cb.put(&mut pair[..n]);
+            cr.put(&mut pair[n..]);
         }
     }
     drop(lock);
@@ -474,7 +512,7 @@ impl VtEncoder {
         let require_key: &CFString = unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder };
         let spec = CFDictionary::<CFString, CFType>::from_slices(&[require_key], &[CFBoolean::new(true).as_ref()]);
 
-        let (pf, cw, ch) = (CFNumber::new_i32(NV12_VIDEO as i32), CFNumber::new_i32(w as i32), CFNumber::new_i32(h as i32));
+        let (pf, cw, ch) = (CFNumber::new_i32(config.profile.pixel_format() as i32), CFNumber::new_i32(w as i32), CFNumber::new_i32(h as i32));
         let io = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
         // SAFETY: reading immutable framework constants.
         let (pf_key, w_key, h_key, io_key): (&CFString, &CFString, &CFString, &CFString) =
@@ -524,6 +562,7 @@ impl VtEncoder {
                     VtProfile::Main => kVTProfileLevel_H264_Main_AutoLevel,
                     VtProfile::High => kVTProfileLevel_H264_High_AutoLevel,
                     VtProfile::HevcMain => kVTProfileLevel_HEVC_Main_AutoLevel,
+                    VtProfile::HevcMain10 => kVTProfileLevel_HEVC_Main10_AutoLevel,
                 },
             )
         };
@@ -625,7 +664,7 @@ impl VtEncoder {
                     None,
                     self.config.width as usize,
                     self.config.height as usize,
-                    NV12_VIDEO,
+                    self.config.profile.pixel_format(),
                     Some(self.attrs.as_ref()),
                     NonNull::from(&mut raw),
                 )
@@ -637,10 +676,30 @@ impl VtEncoder {
     }
 
     /// Submit picture number `index` (planar BT.709 limited-range Y'CbCr, tightly packed) and return
-    /// the compressed frames that came out meanwhile.
+    /// the compressed frames that came out meanwhile. An error for a Main 10 session.
     pub fn encode(&mut self, index: u64, y: &[u8], u: &[u8], v: &[u8]) -> Result<Vec<VtPacket>, String> {
+        if self.config.profile.ten_bit() {
+            return Err("an 8-bit picture for a Main 10 encoder".into());
+        }
+        self.submit(index, |buffer, w, h| fill(buffer, w, h, y, u, v))
+    }
+
+    /// [`encode`](Self::encode) for a Main 10 session: 10-bit code values (0..=1023) in `u16`,
+    /// the same planar layout. An error for any other session.
+    pub fn encode_10(&mut self, index: u64, y: &[u16], u: &[u16], v: &[u16]) -> Result<Vec<VtPacket>, String> {
+        if !self.config.profile.ten_bit() {
+            return Err("a 10-bit picture for an 8-bit encoder".into());
+        }
+        self.submit(index, |buffer, w, h| fill(buffer, w, h, y, u, v))
+    }
+
+    fn submit(
+        &mut self,
+        index: u64,
+        fill: impl FnOnce(&CVImageBuffer, usize, usize) -> Result<(), String>,
+    ) -> Result<Vec<VtPacket>, String> {
         let buffer = self.new_buffer()?;
-        fill(&buffer, self.config.width as usize, self.config.height as usize, y, u, v)?;
+        fill(&buffer, self.config.width as usize, self.config.height as usize)?;
         let value = i64::try_from(index).ok().and_then(|i| i.checked_mul(i64::from(self.config.frame_duration))).ok_or("frame index out of range")?;
         let (pts, duration) = (cm_time(value, self.config.timescale), cm_time(i64::from(self.config.frame_duration), self.config.timescale));
         // SAFETY: the session and buffer are valid (VideoToolbox retains the buffer as long as it

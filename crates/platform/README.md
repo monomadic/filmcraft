@@ -159,8 +159,12 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
 ## Hardware H.265 (HEVC) encoding (macOS)
 
 The same session wrapper, created for `kCMVideoCodecType_HEVC` with the HEVC Main profile
-(`VtProfile::HevcMain`: the profile also says which codec the session is). `Format::Hevc` has no
-built-in encoder, which changes three things from H.264:
+(`VtProfile::HevcMain`: the profile also says which codec the session is). `VtProfile::HevcMain10`
+is the 10-bit session for callers that drive `VtEncoder` themselves: it takes planar 10-bit
+BT.709 limited-range 4:2:0 through `VtEncoder::encode_10` (code values 0..=1023 in `u16`, the
+`Nvenc::encode_10` convention) into P010-style `x420` buffers, and refuses 8-bit pictures, as a
+Main session refuses 10-bit ones (`hevc_main10_keeps_ten_bits`). The export's `Format::Hevc` still
+encodes Main from RGBA. `Format::Hevc` has no built-in encoder, which changes three things from H.264:
 
 - **Choosing the format is the opt-in.** No `hardware_encoding` setting: Export ▸ Format ▸ H.265
   (HEVC), or `"format": "hevc"` in `file.exportMedia` (`h265` is accepted too). The format is

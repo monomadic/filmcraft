@@ -731,3 +731,54 @@ fn the_sessions_run_on_the_hardware_encoder() {
         }
     }
 }
+
+#[test]
+fn hevc_main10_keeps_ten_bits() {
+    let (w, h) = (W as usize, H as usize);
+    let config = VtConfig {
+        width: W,
+        height: H,
+        timescale: 30,
+        frame_duration: 1,
+        keyframe_interval: 30,
+        profile: VtProfile::HevcMain10,
+        rate: VtRate::Vbr { target_kbps: 40_000, max_kbps: 60_000 },
+    };
+    let mut enc = match VtEncoder::new(config.clone()) {
+        Ok(enc) => enc,
+        Err(why) => {
+            eprintln!("SKIPPED: no VideoToolbox hardware HEVC Main 10 encoder ({why})");
+            return;
+        }
+    };
+    let (cw, ch) = (w / 2, h / 2);
+    // A slow horizontal ramp over the whole legal luma range: 10-bit steps an 8-bit path would
+    // round to multiples of four.
+    let y: Vec<u16> = (0..w * h).map(|i| (64 + (i % w) * 876 / (w - 1)) as u16).collect();
+    let u: Vec<u16> = (0..cw * ch).map(|i| (448 + (i % cw) * 128 / (cw - 1)) as u16).collect();
+    let v = vec![512u16; cw * ch];
+    assert!(enc.encode(0, &vec![16; w * h], &vec![128; cw * ch], &vec![128; cw * ch]).is_err(), "8-bit picture into Main 10");
+    let mut packets = Vec::new();
+    for i in 0..8u64 {
+        packets.extend(enc.encode_10(i, &y, &u, &v).expect("encode_10"));
+    }
+    packets.extend(enc.flush().expect("flush"));
+    assert_eq!(packets.len(), 8);
+    let hvcc = enc.parameter_sets().and_then(|p| p.hvcc).expect("hvcC record");
+    let record = filmcraft_isobmff::HevcConfig::parse(&hvcc).expect("hvcC");
+    let entry = SampleEntry::hevc(record, W as u16, H as u16);
+    let mut dec = filmcraft_codecs::software_video_decoder(&entry).expect("software decoder");
+    let mut pictures = Vec::new();
+    for (i, p) in packets.iter().enumerate() {
+        pictures.extend(dec.decode(&p.data, i as i64).expect("decode"));
+    }
+    pictures.extend(dec.flush());
+    assert_eq!(pictures.len(), 8);
+    let PixelData::Yuv16 { planes, bits: 10, .. } = &pictures[7].frame.data else { panic!("not a 10-bit picture") };
+    let error = planes[0].iter().zip(&y).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).sum::<i32>() as f64 / y.len() as f64;
+    let fine = planes[0].iter().filter(|c| **c % 4 != 0).count() as f64 / y.len() as f64;
+    assert!(error < 2.0, "mean luma error {error:.2} codes");
+    assert!(fine > 0.5, "only {:.0}% of luma codes use the two low bits", fine * 100.);
+    let mut main = VtEncoder::new(VtConfig { profile: VtProfile::HevcMain, ..config }).expect("HEVC Main");
+    assert!(main.encode_10(0, &y, &u, &v).is_err(), "10-bit picture into Main");
+}
